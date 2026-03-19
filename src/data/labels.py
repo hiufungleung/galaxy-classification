@@ -30,15 +30,21 @@ def make_labels(
     threshold: float = 0.60,
     max_dk: float = 0.30,
     merger_threshold: float | None = None,
+    max_redshift: float = 0.10,
 ) -> pd.DataFrame:
     """
     Filter rows and assign morphological labels from Galaxy Zoo vote fractions.
 
     Exclusion criteria (applied in order):
-      1. class != 'GALAXY'       — removes stars and QSOs
-      2. sdssPrimary != 1        — removes duplicate observations (prevents train/test leakage)
-      3. nvote_tot < min_votes   — too few votes, label unreliable
-      4. p_dk >= max_dk          — high don't-know: artifact, bad image, or ambiguous
+      1. class != 'GALAXY'          — removes stars and QSOs
+      2. sdssPrimary != 1           — removes duplicate observations (prevents train/test leakage)
+      3. nvote_tot < min_votes      — too few votes, label unreliable
+      4. p_dk >= max_dk             — high don't-know: artifact, bad image, or ambiguous
+      5. spec_z > max_redshift      — distant galaxies are poorly resolved in images and
+                                      have lower S/N spectra; morphology classification
+                                      degrades significantly beyond z~0.10. Galaxy Zoo 1
+                                      papers (Lintott 2011) use z < 0.085 for their clean
+                                      sample. Default 0.10 is a conservative version of this.
 
     Label assignment (only one label per row; rows matching none are excluded):
       p_el > threshold           -> 'elliptical'
@@ -53,6 +59,10 @@ def make_labels(
     max_dk : maximum allowed don't-know fraction
     merger_threshold : separate threshold for mergers (default: same as threshold).
         Set lower (e.g. 0.40) if merger count is too small (<500 examples).
+    max_redshift : upper redshift limit. Galaxies beyond this are excluded because
+        (a) angular size is too small for reliable image-based morphology (<2 arcsec
+        at z>0.15 for a 10 kpc galaxy), and (b) key spectral lines shift out of the
+        SDSS detector window. Set to None to disable this filter.
 
     Returns
     -------
@@ -69,6 +79,9 @@ def make_labels(
         (df["nvote_tot"] >= min_votes) &
         (df["p_dk"] < max_dk)
     )
+    if max_redshift is not None and "spec_z" in df.columns:
+        mask &= (df["spec_z"] <= max_redshift)
+
     df = df[mask].copy()
 
     df["label"] = None
@@ -88,7 +101,8 @@ def make_labels(
     labeled["label_id"] = labeled["label"].map(LABEL_MAP)
 
     counts = labeled["label"].value_counts()
-    print(f"Labeled galaxies: {len(labeled):,} / {len(df):,} filtered rows")
+    z_note = f"  (spec_z <= {max_redshift})" if max_redshift is not None else ""
+    print(f"Labeled galaxies: {len(labeled):,} / {len(df):,} filtered rows{z_note}")
     for cls in ["elliptical", "spiral", "merger"]:
         n = counts.get(cls, 0)
         pct = 100 * n / len(labeled) if len(labeled) > 0 else 0
