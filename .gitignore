@@ -1,22 +1,33 @@
 # Project data (large or regenerated)
-input/tables/DATA7901_DR19.csv
-#input/images/
-#input/spectra/
+input/tables/*.csv
+input/images/*
+input/spectra/
 
-# Python and notebook artifacts
+# Model checkpoints & weights
+checkpoints/tabular/*.pkl
+checkpoints/image/*.pth
+checkpoints/spectral/*.pth
+checkpoints/fusion/*.pth
+checkpoints/results_summary.csv
+
+# Python artifacts
 __pycache__/
-.ipynb_checkpoints/
+*.py[cod]
+*.egg-info/
 
-# Local environments & OS files
-.venv/
-.DS_Store
-# Local configuration files (not committed)
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
 notebooks/config.py
 
-# Jupyter notebook checkpoints
-notebooks/.ipynb_checkpoints/
+# uv / venv  (.python-version is committed — pins Python version for uv sync)
+.venv/
+
+# Large binaries
+# proposal.pdf
 
 # macOS
 .DS_Store
-
-
+CLAUDE.md
+.vscode/
+.idea/
