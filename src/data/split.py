@@ -1,7 +1,7 @@
 # src/data/split.py
 #
-# Creates a fixed stratified 70/15/15 train/val/test split from working_set.csv.
-# Run once; all four models reuse the same split so test comparisons are valid.
+# Expands train/val to all 214k labeled rows while keeping the existing test set fixed.
+# Run once; all models reuse split_test.csv so test comparisons are valid.
 #
 # Usage:
 #   uv run python -m src.data.split
@@ -15,74 +15,66 @@ from sklearn.model_selection import train_test_split
 
 TABLES = Path("input/tables")
 
-WORKING_SET   = TABLES / "working_set.csv"
-SPLIT_TRAIN   = TABLES / "split_train.csv"
-SPLIT_VAL     = TABLES / "split_val.csv"
-SPLIT_TEST    = TABLES / "split_test.csv"
+LABELED_INDEX    = TABLES / "labeled_index.csv"
+SPLIT_TEST       = TABLES / "split_test.csv"
+SPLIT_TRAIN_FULL = TABLES / "split_train_full.csv"
+SPLIT_VAL_FULL   = TABLES / "split_val_full.csv"
 
 
-def make_split(
-    df: pd.DataFrame,
-    val_size: float = 0.15,
-    test_size: float = 0.15,
-    random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def make_full_split(seed: int = 42) -> None:
     """
-    Stratified split on 'label' column.
+    Expand train/val to all 214k labeled rows while keeping the existing test set fixed.
 
-    Returns (train_df, val_df, test_df).
-    Split is stratified so class proportions are preserved across all three sets.
-    random_state=42 is fixed — do not change after the split is created.
+    Strategy:
+      1. Load labeled_index.csv (all labeled galaxies, including those without spectra)
+      2. Remove rows whose objid appears in the existing split_test.csv
+      3. Stratified 85/15 split of the remainder → train_full / val_full
+      4. Save split_train_full.csv and split_val_full.csv
+         (split_test.csv is unchanged — same test set for all models)
     """
-    # First split: train vs (val + test)
-    val_test_size = val_size + test_size
-    train_df, val_test_df = train_test_split(
-        df,
-        test_size=val_test_size,
-        stratify=df["label"],
-        random_state=random_state,
-    )
+    labeled = pd.read_csv(LABELED_INDEX)
+    test_df  = pd.read_csv(SPLIT_TEST)
+    print(f"Labeled index : {len(labeled):,} rows")
+    print(f"Existing test : {len(test_df):,} rows (kept fixed)")
 
-    # Second split: val vs test (relative size within val+test)
-    relative_test_size = test_size / val_test_size
-    val_df, test_df = train_test_split(
-        val_test_df,
-        test_size=relative_test_size,
-        stratify=val_test_df["label"],
-        random_state=random_state,
-    )
+    # Add has_image / has_spectrum flags from working_set (rows that have both).
+    # Rows in labeled_index but NOT in working_set lack a spectrum; images are assumed
+    # present (94% download rate for all 507k rows).
+    working = pd.read_csv(TABLES / "working_set.csv", usecols=["objid", "has_image", "has_spectrum"])
+    labeled = labeled.merge(working[["objid", "has_image", "has_spectrum"]], on="objid", how="left")
+    labeled["has_image"]    = labeled["has_image"].fillna(True).astype(bool)
+    labeled["has_spectrum"] = labeled["has_spectrum"].fillna(False).astype(bool)
+    labeled["has_both"]     = labeled["has_image"] & labeled["has_spectrum"]
 
-    return train_df, val_df, test_df
+    test_ids = set(test_df["objid"])
+    remainder = labeled[~labeled["objid"].isin(test_ids)].reset_index(drop=True)
+    print(f"Remainder for train+val: {len(remainder):,} rows")
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Create stratified train/val/test split")
-    parser.add_argument("--input", default=str(WORKING_SET))
-    parser.add_argument("--val-size", type=float, default=0.15)
-    parser.add_argument("--test-size", type=float, default=0.15)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    df = pd.read_csv(args.input)
-    print(f"Loaded {len(df):,} rows from {args.input}")
-
-    train_df, val_df, test_df = make_split(
-        df, args.val_size, args.test_size, args.seed
+    train_full, val_full = train_test_split(
+        remainder,
+        test_size=0.15,
+        stratify=remainder["label"],
+        random_state=seed,
     )
 
     TABLES.mkdir(parents=True, exist_ok=True)
-    train_df.to_csv(SPLIT_TRAIN, index=False)
-    val_df.to_csv(SPLIT_VAL,   index=False)
-    test_df.to_csv(SPLIT_TEST,  index=False)
+    train_full.to_csv(SPLIT_TRAIN_FULL, index=False)
+    val_full.to_csv(SPLIT_VAL_FULL,     index=False)
 
-    print(f"Split saved:")
-    print(f"  train : {len(train_df):,}  -> {SPLIT_TRAIN}")
-    print(f"  val   : {len(val_df):,}  -> {SPLIT_VAL}")
-    print(f"  test  : {len(test_df):,}  -> {SPLIT_TEST}")
+    print(f"\nFull-data split saved:")
+    print(f"  train_full : {len(train_full):,}  -> {SPLIT_TRAIN_FULL}")
+    print(f"  val_full   : {len(val_full):,}  -> {SPLIT_VAL_FULL}")
+    print(f"  test       : {len(test_df):,}  -> {SPLIT_TEST}  (unchanged)")
+    for name, part in [("train_full", train_full), ("val_full", val_full)]:
+        counts = part["label"].value_counts().to_dict()
+        print(f"  {name} class counts: {counts}")
 
-    for name, part in [("train", train_df), ("val", val_df), ("test", test_df)]:
-        counts = part["label"].value_counts()
-        print(f"  {name} class counts: {counts.to_dict()}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Create full-data train/val split (test set fixed)")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    make_full_split(seed=args.seed)
 
 
 if __name__ == "__main__":

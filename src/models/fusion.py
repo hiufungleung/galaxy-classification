@@ -75,6 +75,13 @@ class LateFusionModel(nn.Module):
         fused = torch.cat([f_img, f_spec, f_tab, hs], dim=1)  # (B, 705)
         return self.head(fused)
 
+    def forward_from_feats(self, img_feat, spec_feat, tab, has_spec):
+        """Phase 1 fast path: use pre-extracted encoder features, skip image/spectral encoders."""
+        f_tab = self.tabular_encoder(tab)                     # (B, 64)
+        hs    = has_spec.unsqueeze(1)                         # (B, 1)
+        fused = torch.cat([img_feat, spec_feat, f_tab, hs], dim=1)  # (B, 705)
+        return self.head(fused)
+
     def freeze_encoders(self):
         """Phase 1: freeze pretrained image and spectral encoders."""
         for p in self.image_encoder.parameters():

@@ -23,10 +23,14 @@ def build_image_encoder(pretrained: bool = True) -> nn.Module:
 class ImageClassifier(nn.Module):
     """Full image classifier: ResNet-18 encoder + classification head."""
 
-    def __init__(self, pretrained: bool = True, num_classes: int = NUM_CLASSES):
+    def __init__(self, pretrained: bool = True, num_classes: int = NUM_CLASSES,
+                 dropout: float = 0.0):
         super().__init__()
         self.encoder = build_image_encoder(pretrained)
-        self.head    = nn.Linear(ENCODER_DIM, num_classes)
+        self.head    = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(ENCODER_DIM, num_classes),
+        ) if dropout > 0 else nn.Linear(ENCODER_DIM, num_classes)
 
     def forward(self, x):
         features = self.encoder(x)

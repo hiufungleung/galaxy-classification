@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.datasets.image import GalaxyImageDataset, get_train_transform, get_val_transform
+from src.datasets.image import GalaxyImageDataset, get_train_transform, get_val_transform
 from src.models.image import ImageClassifier
 from src.utils.io import get_device, save_checkpoint
 from src.utils.metrics import evaluate, print_results
@@ -27,11 +27,19 @@ TABLES      = Path("input/tables")
 IMG_DIR     = Path("input/images")
 CHECKPOINTS = Path("checkpoints/image")
 
-BATCH_SIZE   = 64
+BATCH_SIZE   = 256
 LR           = 1e-4
 MAX_EPOCHS   = 50
 PATIENCE     = 5
-NUM_WORKERS  = 4
+NUM_WORKERS  = 6
+
+# Hyperparam search configs (run with --config A/B/C/D)
+CONFIGS = {
+    "A": dict(lr=1e-4, dropout=0.0, pretrained=True),   # baseline
+    "B": dict(lr=1e-3, dropout=0.0, pretrained=True),   # higher LR
+    "C": dict(lr=1e-4, dropout=0.3, pretrained=True),   # add dropout
+    "D": dict(lr=1e-4, dropout=0.0, pretrained=False),  # random init (no ImageNet)
+}
 
 
 def class_weights(labels: np.ndarray, num_classes: int = 3) -> torch.Tensor:
@@ -67,13 +75,26 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet-18 image baseline")
-    parser.add_argument("--train",      default=str(TABLES / "split_train.csv"))
-    parser.add_argument("--val",        default=str(TABLES / "split_val.csv"))
-    parser.add_argument("--test",       default=str(TABLES / "split_test.csv"))
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--epochs",     type=int, default=MAX_EPOCHS)
-    parser.add_argument("--patience",   type=int, default=PATIENCE)
+    parser.add_argument("--train",       default=str(TABLES / "split_train_full.csv"))
+    parser.add_argument("--val",         default=str(TABLES / "split_val_full.csv"))
+    parser.add_argument("--test",        default=str(TABLES / "split_test.csv"))
+    parser.add_argument("--batch-size",  type=int,   default=BATCH_SIZE)
+    parser.add_argument("--epochs",      type=int,   default=MAX_EPOCHS)
+    parser.add_argument("--patience",    type=int,   default=PATIENCE)
+    parser.add_argument("--lr",          type=float, default=LR)
+    parser.add_argument("--dropout",     type=float, default=0.0)
+    parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--config",      default=None, choices=list(CONFIGS.keys()),
+                        help="Named hyperparam config (A/B/C/D); overrides lr/dropout/pretrained")
     args = parser.parse_args()
+
+    # Apply named config if given
+    if args.config:
+        cfg = CONFIGS[args.config]
+        args.lr          = cfg["lr"]
+        args.dropout     = cfg["dropout"]
+        args.no_pretrained = not cfg["pretrained"]
+        print(f"Config {args.config}: {cfg}")
 
     device = get_device()
     print(f"Device: {device}")
@@ -83,28 +104,38 @@ def main():
     val_df   = pd.read_csv(args.val)
     test_df  = pd.read_csv(args.test)
 
-    # Keep only rows where image exists
-    def has_img(df): return df[df["objid"].apply(lambda x: (IMG_DIR / f"{x}.jpeg").exists())]
-    train_df, val_df, test_df = has_img(train_df), has_img(val_df), has_img(test_df)
+    # Keep only rows where image exists (has_image column pre-computed in split CSVs)
+    for df_name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        if "has_image" not in df.columns:
+            raise ValueError(f"{df_name} split missing 'has_image' column — re-run src.data.split")
+    train_df = train_df[train_df["has_image"]].reset_index(drop=True)
+    val_df   = val_df[val_df["has_image"]].reset_index(drop=True)
+    test_df  = test_df[test_df["has_image"]].reset_index(drop=True)
 
     train_ds = GalaxyImageDataset(train_df, IMG_DIR, get_train_transform())
     val_ds   = GalaxyImageDataset(val_df,   IMG_DIR, get_val_transform())
     test_ds  = GalaxyImageDataset(test_df,  IMG_DIR, get_val_transform())
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = ImageClassifier(pretrained=True).to(device)
+    pretrained = not args.no_pretrained
+    model = ImageClassifier(pretrained=pretrained, dropout=args.dropout).to(device)
+    print(f"Model: pretrained={pretrained}  lr={args.lr}  dropout={args.dropout}")
 
     weights   = class_weights(train_df["label_id"].values).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = AdamW(model.parameters(), lr=LR)
+    optimizer = AdamW(model.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # ── Training loop ─────────────────────────────────────────────────────
     CHECKPOINTS.mkdir(parents=True, exist_ok=True)
+    suffix = f"_config{args.config}" if args.config else ("_full" if args.full_data else "")
+    ckpt_path    = CHECKPOINTS / f"resnet18{suffix}_best.pth"
+    results_path = CHECKPOINTS / f"test_results{suffix}.pkl"
+
     best_f1, patience_counter = 0.0, 0
 
     for epoch in range(1, args.epochs + 1):
@@ -118,7 +149,8 @@ def main():
         if val_f1 > best_f1:
             best_f1 = val_f1
             patience_counter = 0
-            save_checkpoint(model, CHECKPOINTS / "resnet18_best.pth", epoch=epoch, val_macro_f1=best_f1)
+            save_checkpoint(model, ckpt_path, epoch=epoch, val_macro_f1=best_f1)
+            print(f"Checkpoint saved: {ckpt_path}")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -126,14 +158,15 @@ def main():
                 break
 
     # ── Test evaluation ───────────────────────────────────────────────────
-    from src.utils.io import load_checkpoint
-    load_checkpoint(model, CHECKPOINTS / "resnet18_best.pth", device)
-    _, test_results = run_epoch(model, test_loader, criterion, optimizer, device, train=False)
-    print_results(test_results, "Test (best checkpoint)")
-
     import pickle
-    with open(CHECKPOINTS / "test_results.pkl", "wb") as f:
+    from src.utils.io import load_checkpoint
+    load_checkpoint(model, ckpt_path, device)
+    _, test_results = run_epoch(model, test_loader, criterion, optimizer, device, train=False)
+    print_results(test_results, f"Test — config {args.config or 'default'}")
+
+    with open(results_path, "wb") as f:
         pickle.dump(test_results, f)
+    print(f"Results saved: {results_path}")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 [project]
-name = "galaxy-classification-guide"
+name = "galaxy-classification"
 version = "0.1.0"
 description = "DATA7901 multi-modal galaxy morphology classification (SDSS DR19)"
 readme = "README.md"
@@ -17,3 +17,12 @@ dependencies = [
     "tqdm>=4.67.3",
     "xgboost>=3.2.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

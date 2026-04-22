@@ -24,23 +24,21 @@ def compute_class_weights(labels: np.ndarray) -> dict:
     return weights
 
 
-def build_xgb(n_estimators: int = 500, random_state: int = 42) -> XGBClassifier:
-    """
-    XGBoost classifier.
-    - tree_method='hist' for fast training on CPU
-    - eval_metric='mlogloss' for multi-class
-    - early_stopping_rounds set in train script via fit() kwargs
-    """
+def build_xgb(
+    n_estimators:  int   = 500,
+    max_depth:     int   = 6,
+    learning_rate: float = 0.05,
+    random_state:  int   = 42,
+) -> XGBClassifier:
     return XGBClassifier(
         n_estimators=n_estimators,
-        max_depth=6,
-        learning_rate=0.05,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
         subsample=0.8,
         colsample_bytree=0.8,
         tree_method="hist",
         eval_metric="mlogloss",
-        use_label_encoder=False,
-        random_state=random_state,
+                random_state=random_state,
         n_jobs=-1,
     )
 
@@ -51,9 +49,16 @@ class TabularPipeline:
     Scaler is fitted on training data only and reused for val/test.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        n_estimators:  int   = 500,
+        max_depth:     int   = 6,
+        learning_rate: float = 0.05,
+    ):
         self.scaler = StandardScaler()
-        self.model  = build_xgb()
+        self.model  = build_xgb(n_estimators=n_estimators,
+                                max_depth=max_depth,
+                                learning_rate=learning_rate)
 
     def fit(self, X_train, y_train, X_val=None, y_val=None):
         X_train_s = self.scaler.fit_transform(X_train)

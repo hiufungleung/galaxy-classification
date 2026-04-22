@@ -1,288 +1,440 @@
-## DATA7901 Galaxy Classification Starter (UQ)
+# Galaxy Morphology Classification — DATA7901 (UQ)
 
-This repository is a ready-to-run starter kit for the semester project described in `galaxy_classification_guide.md`. It walks you through getting the data from SDSS, exploring key columns, and downloading/visualising galaxy images (DESI Legacy Survey) and spectra (SDSS DR19).
+Multi-modal galaxy morphology classification using SDSS DR19 data. Three modalities are trained independently and combined via late fusion:
 
-### What you’ll do
-- Run the provided SQL on SDSS CasJobs to build your project table
-- Export the table to CSV and place it in this repo
-- Use the notebooks to validate data, plot histograms, and fetch/preview cutouts and spectra
+| Modality | Model | Macro F1 | Notes |
+| --- | --- | --- | --- |
+| Tabular photometry | XGBoost | 0.775 | CPU, ~5 min |
+| Galaxy images | ResNet-18 | 0.807 | GPU, ~1–2 hr |
+| Optical spectra | 1D-CNN | 0.563 | GPU, ~30 min |
+| **Late fusion** | MLP head | **0.873** | GPU, ~1 hr |
 
-### Repo layout
-- `galaxy_classification_guide.md`: Project background and goals (read this first)
-- `input/queries/DATA7901_DR19_casjobs.sql`: SQL to run on SDSS CasJobs
-- `input/tables/`: Put your exported CSV here (expected filename: `DATA7901_DR19.csv`)
-- `input/images/`: JPEG cutouts downloaded by the notebook
-- `input/spectra/`: FITS spectra downloaded by the notebook
-- `notebooks/explore_tables.ipynb`: Main walkthrough: load CSV, validate fields, histograms, download and visualise images and spectra
-- `src/`: We will keep all the Python scripts associated with the project here. If we talk about a Python script (any `*.py` file), it is stored in `src/`.
-- `models/`: This folder keeps all the trained models (saved checkpoints/weights, experiment outputs).
-- `.gitignore`: **Important!** This file prevents large data files and sensitive configurations from being pushed to GitHub. It should include:
-  - Data directories (`input/images/`, `input/spectra/`, `input/tables/*.csv`)
-  - Model files (`models/*.pkl`, `models/*.h5`, `models/*.pth`)
-  - Personal configuration files with local paths (`config.py`, `local_settings.py`)
-  - System files (`__pycache__/`, `.DS_Store`, `*.pyc`)
+Three morphological classes: **elliptical**, **spiral**, **merger** (Galaxy Zoo 1 vote-fraction labels, threshold = 0.60).
 
-### Prerequisites
-- Python 3.10+ (tested with 3.12)
-- Jupyter (Lab or Notebook)
-- Packages: `numpy`, `pandas`, `matplotlib`, `astropy`
-- Command-line `wget` (recommended) for downloads
-  - macOS: `brew install wget`
-  - Ubuntu/Debian: `sudo apt-get install wget`
-  - Windows: use WSL or install wget; the notebook also includes a Python fallback for images
+---
 
-Suggested environment setup:
+## Table of Contents
+
+1. [Repository Layout](#repository-layout)
+2. [Environment Setup](#environment-setup)
+3. [Data Acquisition](#data-acquisition)
+4. [Running the Pipeline](#running-the-pipeline)
+5. [Training Individual Models](#training-individual-models)
+6. [Notebooks](#notebooks)
+7. [Results & Evaluation](#results--evaluation)
+8. [Project Architecture](#project-architecture)
+9. [Troubleshooting](#troubleshooting)
+
+---
+
+## Repository Layout
+
+```text
+.
+├── input/
+│   ├── queries/                    # SQL files for SDSS CasJobs
+│   │   ├── DATA7901_DR19_casjobs_merged.sql   # recommended: explicit columns, aliases
+│   │   └── ...                    # exploratory / partial queries
+│   ├── tables/                    # CSV exports (gitignored — large files)
+│   │   ├── DATA7901_DR19_merged.csv           # 507k rows, 723 columns (main table)
+│   │   ├── labeled_index.csv                  # 214k labeled rows (output of Step 0)
+│   │   ├── working_set.csv                    # 142k rows with both image + spectrum
+│   │   ├── split_train.csv / split_val.csv / split_test.csv   # working-set split
+│   │   └── split_train_full.csv / split_val_full.csv          # full-data split
+│   ├── images/                    # JPEG cutouts from DESI Legacy Survey (gitignored)
+│   └── spectra/                   # FITS files from SDSS DR19 archive (gitignored)
+│
+├── src/
+│   ├── data/
+│   │   ├── rename.py              # Column rename map (resolves CasJobs collisions)
+│   │   ├── labels.py              # make_labels() — threshold-based label assignment
+│   │   ├── features.py            # engineer_features(), handle_missing(), TABULAR_FEATURES
+│   │   └── split.py               # Stratified 70/15/15 split → input/tables/
+│   ├── datasets/
+│   │   ├── image.py               # GalaxyImageDataset (PyTorch)
+│   │   ├── spectral.py            # SpectralDataset + load_spectrum() resampler
+│   │   └── multimodal.py          # MultiModalDataset (all three modalities)
+│   ├── models/
+│   │   ├── tabular.py             # TabularPipeline (StandardScaler + XGBoost)
+│   │   ├── image.py               # ImageClassifier (ResNet-18 encoder + Linear head)
+│   │   ├── spectral.py            # SpectralClassifier (1D-CNN encoder + Linear head)
+│   │   └── fusion.py              # LateFusionModel (705-d concat → MLP → 3 classes)
+│   ├── train/
+│   │   ├── tabular.py             # XGBoost training + optional grid search
+│   │   ├── image.py               # ResNet-18 training loop (configs A–D)
+│   │   ├── spectral.py            # 1D-CNN training loop (configs A–D)
+│   │   ├── fusion.py              # Two-phase late fusion training + ablation
+│   │   └── physical.py            # Stretch task: physical (star-forming / passive)
+│   ├── evaluate.py                # Unified evaluation across all four models
+│   └── interpret.py               # XGBoost feature importance + GradCAM
+│
+├── checkpoints/                   # Saved weights and results (gitignored)
+│   ├── tabular/                   # xgb_model_full.pkl, test_results*.pkl, grid_search_results.csv
+│   ├── image/                     # resnet18_configC_best.pth, test_results*.pkl, gradcam_samples.png
+│   ├── spectral/                  # cnn1d_best.pth, test_results*.pkl
+│   ├── fusion/                    # late_fusion_best.pth, test_results*.pkl
+│   ├── physical/                  # tabular_results.pkl, spectral_results.pkl
+│   └── results_summary.csv        # Final four-model comparison table
+│
+├── notebooks/
+│   ├── 00_run_pipeline.ipynb      # Run the full pipeline from a notebook
+│   ├── 01_label_audit.ipynb       # Step 0: class counts, vote distributions, sentinel check
+│   ├── 02_results.ipynb           # Final results figures for the report
+│   ├── 03_walkthrough.ipynb       # Full presentation walkthrough (training, encoding, viz)
+│   └── explore_tables.ipynb       # Initial data exploration (starter kit)
+│
+├── scripts/
+│   ├── download_images.py         # Batch JPEG downloader (Legacy Survey)
+│   └── download_spectra.py        # Batch FITS downloader (SDSS archive)
+│
+├── run_pipeline.py                # One-shot pipeline runner (all stages, resumable)
+├── pyproject.toml                 # uv project config + pinned dependencies
+└── uv.lock                        # Fully locked dependency graph
+```
+
+---
+
+## Environment Setup
+
+### Recommended: `uv` (locked, reproducible)
+
+```bash
+# Install uv if not already installed
+pip install uv
+
+# Install all dependencies from the lock file (Python 3.12)
+uv sync
+
+# Verify installation
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+> **GPU note:** `torch` and `torchvision` are installed from the PyTorch CUDA 12.8 index. If you are on CPU-only or a different CUDA version, edit `pyproject.toml` and `uv.lock` accordingly, or install PyTorch separately.
+
+### Alternative: pip + venv
+
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install jupyter numpy pandas matplotlib astropy
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install jupyter numpy pandas matplotlib astropy scikit-learn xgboost tqdm Pillow
 ```
 
-Alternative using conda:
+---
+
+## Data Acquisition
+
+### Step 1 — Run the SQL query on SDSS CasJobs
+
+1. Go to [https://casjobs.sdss.org/casjobs/](https://casjobs.sdss.org/casjobs/) and sign in.
+2. Select **DR19** from the Context dropdown.
+3. Open `input/queries/DATA7901_DR19_casjobs_merged.sql` and paste it into the query editor.
+4. Submit the job. When finished, export `mydb.DATA7901_DR19_merged` as CSV.
+5. Save the file to:
+
+```text
+input/tables/DATA7901_DR19_merged.csv
+```
+
+> **Why the merged query?** The wildcard query (`p.*, s.*, v.*`) silently renames duplicate columns (e.g., `SpecObj.z` → `Column8`). The merged query uses explicit aliases (`s.z AS spec_z`, `s.mjd AS spec_mjd`) so all column names are unambiguous. See `CLAUDE.md` for the full column collision audit.
+>
+> **Size note:** The full table is ~507k rows. CasJobs caps export at ~500 MB; if the export is split across multiple files, concatenate them:
+
 ```bash
-conda create -n data7901 python=3.12 -y
-conda activate data7901
-pip install jupyter numpy pandas matplotlib astropy
+{ head -1 MERGED1.csv; tail -n +2 MERGED1.csv; tail -n +2 MERGED2.csv; tail -n +2 MERGED3.csv; } > DATA7901_DR19_merged.csv
 ```
 
-### Step 1 — Build the table in SDSS CasJobs
-CasJobs portal for running SDSS SQL queries: [https://casjobs.sdss.org/casjobs/](https://casjobs.sdss.org/casjobs/)
-1) Go to the SDSS CasJobs website and sign in (create an account if needed).
-   You should see a page similar to this:
+### Step 2 — Download galaxy images
 
-   ![CasJobs home](notebooks/figures/casjobs_home.png)
-
-2) Click "Login". You can create a new SciServer account or use Globus to authenticate:
-
-   ![CasJobs / SciServer login](notebooks/figures/casjobs_login.png)
-
-3) After confirming your email and completing sign-in, you should see the CasJobs query workspace. This is where you'll paste and run the SQL provided in this repo:
-
-   ![CasJobs query workspace](notebooks/figures/casjobs_query.png)
-
-4) Open a new query window and paste the contents of `input/queries/DATA7901_DR19_casjobs.sql`.
-  - Select DR19 from the dropdown menu under Context 
-   - The query creates `mydb.DATA7901_DR19` with the following (key) columns:
-     - `objid`, `ra`, `dec`, Galactic `l`, `b`
-     - Spectra identifiers: `specObjID`, `plate`, `mjd`, `fiberid`, `class`, `programname`, `sdssPrimary`
-     - Galaxy Zoo votes (counts; nvote_*):
-       - `nvote_tot`: total votes
-       - `nvote_std`: votes for the standard classification
-       - `nvote_mr1`: votes for the vertical mirrored classification
-       - `nvote_mr2`: votes for the diagonally mirrored classification
-       - `nvote_mon`: votes for the monochrome classification
-     - Galaxy Zoo vote fractions (p_*; values in [0,1]):
-       - `p_el`: elliptical
-       - `p_cw`: clockwise spiral
-       - `p_acw`: anticlockwise spiral
-       - `p_edge`: edge-on disk
-       - `p_dk`: don't know
-       - `p_mg`: merger
-       - `p_cs`: combined spiral (cw + acw + edge-on)
-
-   Visual guide to Galaxy Zoo class buttons used in the project (reproduced from Lintott et al. 2011):
-
-   ![Galaxy Zoo classes](notebooks/figures/gz1_classes_table.png)
-
-   Source: Lintott, C. et al. (2011), “Galaxy Zoo 1: data release of morphological classifications for nearly 900,000 galaxies,” MNRAS, 410, 166. ADS link: https://ui.adsabs.harvard.edu/abs/2011MNRAS.410..166L/abstract
-
-    SDSS schema references (useful while building and inspecting your table):
-    - SDSS Table Descriptions: [https://skyserver.sdss.org/dr7/en/help/docs/tabledesc.asp](https://skyserver.sdss.org/dr7/en/help/docs/tabledesc.asp)
-    - TABLE PhotoObj: [https://skyserver.sdss.org/dr7/en/help/browser/browser.asp?n=PhotoObj&t=U](https://skyserver.sdss.org/dr7/en/help/browser/browser.asp?n=PhotoObj&t=U)
-    - TABLE SpecObj: [https://skyserver.sdss.org/dr7/en/help/browser/browser.asp?n=SpecObj&t=U](https://skyserver.sdss.org/dr7/en/help/browser/browser.asp?n=SpecObj&t=U)
-    - TABLE zooVotes (Galaxy Zoo): [https://skyserver.sdss.org/dr8/en/help/browser/description.asp?n=zooVotes&t=U](https://skyserver.sdss.org/dr8/en/help/browser/description.asp?n=zooVotes&t=U)
-   - The filters in the SQL (magnitude and redshift cuts, and `zWarning = 0`) keep the result manageable.
-
-5) Submit the query. Within a few seconds to minutes (depending on load), the job status should be "Finished" with the message "Query Complete". That confirms your table was created in `MyDB` without errors:
-
-   ![CasJobs query finished](notebooks/figures/casjobs_query_finished.png)
-
-6) When it completes, export the results from `mydb.DATA7901_DR19` as CSV.
-7) Save the CSV locally as `DATA7901_DR19.csv` and place it at:
-```
-input/tables/DATA7901_DR19.csv
+```bash
+uv run python scripts/download_images.py
+# Images saved to input/images/<objid>.jpeg
+# Failed downloads logged to input/tables/image_download_failures.txt
 ```
 
-Notes:
-- Some tools may rename duplicate column names (e.g., `ra`, `dec` appear in multiple joined tables). The provided notebooks expect the CSV format produced by CasJobs; the examples here already work with the CSV used during development.
+Stratified sampling (up to 10k per class) is applied by default. The script is resumable — already-downloaded files are skipped.
 
-### Step 2 — Explore and validate the table
-Open `notebooks/explore_tables.ipynb` and run the cells in order:
-- Load the CSV from `input/tables/DATA7901_DR19.csv`.
-- Validate completeness and ranges for all Galaxy Zoo fields for rows where `class == 'GALAXY'`:
-  - p_* (fractions in [0,1]): `p_el`, `p_cw`, `p_acw`, `p_edge`, `p_dk`, `p_mg`, `p_cs`
-  - nvote_* (non-negative integers): `nvote_tot`, `nvote_std`, `nvote_mr1`, `nvote_mr2`, `nvote_mon`
-- Plot histograms for all `p_*` and all `nvote_*` columns.
+### Step 3 — Download spectra
 
-### Step 3 — Download a few image cutouts (optional throttle)
-In the same notebook:
-- A cell prepares “valid galaxies” and builds the Legacy Survey cutout URLs.
-- By default, it prints commands and limits downloads (e.g., first 10). You can increase or decrease `num_to_download`.
-- Images are saved as `input/images/<objid>.jpeg`.
+```bash
+uv run python scripts/download_spectra.py
+# Spectra saved to input/spectra/spec-<plate>-<mjd>-<fiberid>.fits
+# Failed downloads logged to input/tables/spectra_download_failures.txt
+# Also writes input/tables/working_set.csv
+```
 
-If you don’t have `wget`, either install it or use the Python fallback cell (already included) that uses `urllib` to fetch the same URLs.
+---
 
-### Step 4 — Visualise the cutouts
-- The notebook includes a cell that shows the first 10 downloaded JPEGs side-by-side with titles from the filename (`objid`).
+## Running the Pipeline
 
-### Step 5 — Download a small photometric catalogue sample (PhotoObj)
+The simplest way to run everything is the one-shot pipeline script. It is **resumable** — each stage checks whether its output already exists and skips it.
 
-This step mirrors Step 1, but targets the full photometric catalogue. Because the table is large, start by downloading only the first 100 rows to validate your workflow.
+```bash
+# Run all stages (skip completed ones)
+uv run python run_pipeline.py
 
-- Open a new CasJobs query window and use the query in `input/queries/DATA7901_DR19_casjobs_photo.sql`. To limit output for testing, adapt the select to `TOP (100)` (see comments inside the SQL file for guidance).
-- Run the query. Export the result to CSV and examine columns to confirm they match expectations. Only after you are confident, consider exporting the full photometric catalogue; be mindful this can be a very large file (GB‑scale), so plan storage and bandwidth accordingly.
- - Note: When exporting the full photometric dataset, you may exceed the default **CasJobs quota** (typically **500 MB** for `MyDB`). If the job fails due to size, request a quota increase in CasJobs before re‑running.
+# Re-run everything from scratch
+uv run python run_pipeline.py --force
+```
 
-### Step 6 — Download and visualise spectra (optional)
-- The notebook includes a cell to download the first N spectra using `plate`, `mjd`, and `fiberid` into `input/spectra/`.
-- It then plots a few spectra using `astropy.io.fits` to read common SDSS formats (prefers table HDUs with `loglam`/`flux`, falls back to image HDUs with `COEFF0/COEFF1`).
+### Pipeline stages (in order)
 
+| Stage | Script | Output | Hardware |
+| --- | --- | --- | --- |
+| 1. Full-data split | `src.data.split` | `split_train_full.csv`, `split_val_full.csv` | CPU, <1 min |
+| 2. Tabular baseline | `src.train.tabular --grid-search` | `checkpoints/tabular/` | CPU, ~15 min |
+| 3. Image baseline (A–D) | `src.train.image` | `checkpoints/image/` | GPU, ~2–4 hr |
+| 4. Spectral baseline (A–D) | `src.train.spectral` | `checkpoints/spectral/` | GPU, ~2 hr |
+| 5. Late fusion | `src.train.fusion` | `checkpoints/fusion/` | GPU, ~1 hr |
+| 6. Ablation study | `src.train.fusion --ablate` | `checkpoints/fusion/*_ablate_*.pkl` | GPU, ~3 hr |
+| 7. Interpretability | `src.interpret` | Feature importance + GradCAM | CPU/GPU, ~5 min |
+| 8. Physical classification | `src.train.physical` | `checkpoints/physical/` | CPU/GPU, ~10 min |
+| 9. Evaluation summary | `src.evaluate` | `checkpoints/results_summary.csv` | CPU, <1 min |
 
-### Step 7 — Download a small spectroscopic catalogue sample (SpecObj)
+---
 
-As with the photometric sample, begin with a small spectroscopic extract to validate the pipeline.
+## Training Individual Models
 
-- Open a new CasJobs query window and use the query in `input/queries/DATA7901_DR19_casjobs_spectra.sql`. To keep the output manageable for testing, adapt the select to `TOP (100)` (see notes in the SQL file).
-- Run the query. Export to CSV and inspect. If/when you decide to export the full spectroscopic set, note that files will be large; plan storage and versioning appropriately.
- - Note: Exporting the full spectroscopic dataset can also exceed the default **CasJobs quota** (about **500 MB**). If you hit quota errors, request a quota increase in CasJobs and try again.
+Each training script can also be run standalone.
 
+### Tabular (XGBoost)
 
-### Troubleshooting
-- “File not found”: confirm your CSV is named `DATA7901_DR19.csv` and placed under `input/tables/`.
-- Missing `wget`: install it or use the Python fallback image downloader cell.
-- Missing `astropy`: `pip install astropy`.
-- Spectra 404s: not every `plate/mjd/fiberid` exists at the hard-coded path. Try a few, or adjust the base URL.
-- Duplicate columns in CSV: CasJobs (and pandas) may rename duplicates; the provided notebook uses columns as exported during development.
+```bash
+# Default: working-set split, no grid search
+uv run python -m src.train.tabular
 
-### Next steps (project work)
-After you’ve verified the data flows end-to-end:
-- Feature engineering from tables (e.g., thresholds on `p_el`, vote counts)
-- Image models (CNNs) and spectral models
-- Model evaluation and reporting
+# Full-data split (all 214k labeled rows) + hyperparameter grid search
+uv run python -m src.train.tabular --full-data --grid-search
+```
 
+Outputs: `checkpoints/tabular/xgb_model_full.pkl`, `test_results_full.pkl`, `grid_search_results.csv`
 
-Tips:
-- Be gentle with external services. Keep download limits small (e.g., 10–50) while testing.
-- Think carefully about data volume before mass downloads (cutouts/spectra can be many large files):
-  - Start small; download a handful first and verify your pipeline end‑to‑end.
-  - Estimate storage needs (files × average size) and ensure you have space and bandwidth.
-  - Save to the intended locations (`input/images/`, `input/spectra/`) and keep a tidy directory structure.
-  - If pushing to github remember to add large files and folders to the gitignore file
-  - Consider caching, checkpoints, or manifests to avoid repeated downloads.
-  - If you need everything, parallelize cautiously and be respectful of rate limits.
+### Image (ResNet-18)
 
-#### Understanding Your Astronomical Data
+```bash
+# Config A — baseline (lr=1e-4, no dropout, pretrained ImageNet)
+uv run python -m src.train.image
 
-- **Exploratory Data Analysis (EDA) is crucial**:
-  - Visualize distributions of key features (redshift, magnitude, colors)
-  - Check class imbalance in galaxy types
-  - Identify correlations between features
-  - Understand missingness patterns (not random in astronomy!)
-  
-- **Domain-specific considerations**:
-  - Photometric errors are not uniform (fainter objects = larger errors)
-  - Selection effects: your sample may be biased by survey limitations
-  - Physical relationships exist (e.g., color-magnitude diagrams)
+# Config C — best (lr=1e-4, dropout=0.3, pretrained ImageNet)
+uv run python -m src.train.image --dropout 0.3 --suffix configC
 
-#### Astronomy-specific ML Considerations
+# Config B — high learning rate
+uv run python -m src.train.image --lr 5e-5 --suffix configB
 
-- **Feature engineering opportunities**:
-  - Color indices (e.g., g-r, r-i)
-  - Morphological parameters from images
-  - Spectral line ratios and equivalent widths
-  - Photometric redshift estimates
-  
-- **Handling measurement uncertainties**:
-  - Consider using error-weighted loss functions
-  - Propagate uncertainties through your pipeline
-  - Bootstrap/Monte Carlo for uncertainty quantification
+# Config D — random init (no ImageNet pretraining)
+uv run python -m src.train.image --no-pretrain --dropout 0.3 --suffix configD
+```
 
-#### Scalability and Efficiency
+| Config | LR | Dropout | Pretrained | Macro F1 | Merger F1 |
+| --- | --- | --- | --- | --- | --- |
+| A | 1e-4 | 0.0 | Yes | 0.806 | 0.492 |
+| B | 1e-3 | 0.0 | Yes | 0.762 | 0.389 |
+| **C** | **1e-4** | **0.3** | **Yes** | **0.807** | **0.501** |
+| D | 1e-4 | 0.0 | No | 0.775 | 0.413 |
 
-- **Memory management**:
-  - Use data generators/loaders for large datasets
-  - Consider chunking strategies for processing
-  - Profile memory usage before scaling up
-  
-- **Model complexity vs. performance trade-off**:
-  - Start with simple, fast models for baseline
-  - Document training time and inference speed
-  - Consider model size for deployment scenarios
+Best checkpoint: `checkpoints/image/resnet18_configC_best.pth`
 
-#### Project Organization and Reproducibility
+### Spectral (1D-CNN)
 
-- **Version control best practices**:
-  - Don't commit large data files (use .gitignore)
-  - Document random seeds for reproducibility
-  - Keep a changelog of experiments
-  
-- **Documentation requirements**:
-  - README with clear setup instructions
-  - Requirements.txt or environment.yml
-  - Jupyter notebooks with markdown explanations
-  - Final report linking to industry applications
+```bash
+# Config A — baseline (lr=1e-4, 32 base filters, no dropout)
+uv run python -m src.train.spectral
 
-#### Guidance for building ML models
+# Config C — wider filters
+uv run python -m src.train.spectral --base-filters 64 --suffix configC
 
-- First and foremost, this is your project — organize it in a way that works for you and be innovative.
-- Break work into small tasks:
-  - Clarify the objective (what is success?).
-  - Choose problem type: Classification vs Regression.
-  - Prepare your data: handle missing values, outliers, scaling, encode categoricals.
-  - Choose and implement cross‑validation.
-  - Select candidate models; train baselines and iterate.
-  - Evaluate with appropriate metrics; fine‑tune hyperparameters.
+# Config D — with dropout
+uv run python -m src.train.spectral --dropout 0.3 --suffix configD
+```
 
-- Cross-validation options (pick what fits your data):
-  - **Stratified K-fold**: Recommended for imbalanced galaxy classes
-  - **Hold-out**: Good for large datasets (70/15/15 or 60/20/20 split)
-  - **Time-based split**: If using time-series spectral features
-  - K-fold: Standard choice for balanced datasets
-  - Group K-fold: If galaxies are grouped (e.g., by survey region)
+| Config | LR | Filters | Dropout | Macro F1 | Merger F1 |
+| --- | --- | --- | --- | --- | --- |
+| **A** | **1e-4** | **32** | **0.0** | **0.563** | **0.118** |
+| B | 1e-3 | 32 | 0.0 | 0.557 | 0.121 |
+| C | 1e-4 | 64 | 0.0 | 0.543 | 0.082 |
+| D | 1e-4 | 32 | 0.3 | 0.492 | 0.065 |
 
-- Data and model types:
-  - Supervised: has one or more targets
-    - Classification: predict a category
-    - Regression: predict a continuous value
-  - Unsupervised: no target (e.g., clustering, dimensionality reduction)
+Best checkpoint: `checkpoints/spectral/cnn1d_best.pth`
 
-- Tabulated data — common model choices:
-  - Decision Trees
-  - Random Forests
-  - Logistic Regression
-  - Gradient Boosting (e.g., XGBoost/LightGBM/CatBoost)
-  - Symbolic Regression (PySR/gplearn) — discovers interpretable equations
-  - Neural Networks (use judiciously; simpler models may match performance with less complexity)
+### Late Fusion
 
-- Evaluation metrics (select per objective):
-  - **Classification**: 
-    - Confusion matrix (essential for multi-class)
-    - Per-class precision/recall (identify weak classes)
-    - Weighted/macro/micro F1 scores
-    - ROC curves for each class (one-vs-rest)
-  - **Regression** (if predicting continuous properties):
-    - MAE, MSE, RMSE
-    - R² score
-    - Residual plots
+```bash
+# Train fusion with best encoders
+uv run python -m src.train.fusion \
+    --img-ckpt  checkpoints/image/resnet18_configC_best.pth \
+    --spec-ckpt checkpoints/spectral/cnn1d_best.pth \
+    --suffix    _bestenc
 
-- Deep Learning considerations:
-  - CNNs for galaxy images (consider transfer learning from pre-trained models)
-  - 1D CNNs or LSTMs for spectra
-  - Attention mechanisms for identifying important features
-  - Start with smaller architectures; deep ≠ better
-  - Monitor for overfitting (use early stopping, dropout)
+# Ablation: zero out one modality during training and test
+uv run python -m src.train.fusion --ablate spectral --suffix _ablate_nospec
+uv run python -m src.train.fusion --ablate image    --suffix _ablate_noimg
+uv run python -m src.train.fusion --ablate tabular  --suffix _ablate_notab
+```
 
-#### Common Pitfalls to Avoid
+| Fusion variant | Macro F1 | Merger F1 |
+| --- | --- | --- |
+| **Full (img + spec + tab)** | **0.873** | **0.679** |
+| No spectral (img + tab) | 0.852 | 0.625 |
+| No tabular (img + spec) | 0.817 | 0.525 |
+| No image (spec + tab) | 0.572 | 0.061 |
 
-- Data leakage: Ensure no target information in features
-- Overfitting to small samples: Use proper validation
-- Ignoring class imbalance: Consider SMOTE, class weights
-- Not checking data quality: Remove artifacts, bad pixels
-- Forgetting to scale features: Especially mixing images/tabular data
-- Training on incomplete data: Handle NaNs before modeling
+### Physical Classification (stretch task)
 
-### Acknowledgements
-- SDSS CasJobs and data services
-- Legacy Survey image cutouts
+```bash
+uv run python -m src.train.physical
+```
 
+Classifies galaxies as **star-forming** (g−r < 0.65) vs **passive** (g−r ≥ 0.65). The spectral 1D-CNN achieves macro F1 = 0.935 on this task vs 0.563 on morphological classification — confirming that spectra encode physical type rather than visual morphology.
 
+### Interpretability
+
+```bash
+uv run python -m src.interpret
+```
+
+Produces:
+
+- `checkpoints/tabular/feature_importance.csv` — XGBoost gain-based feature importance
+- `checkpoints/image/gradcam_samples.png` — GradCAM activation maps (2 galaxies per class)
+
+---
+
+## Notebooks
+
+Open Jupyter Lab with:
+
+```bash
+uv run jupyter lab
+```
+
+| Notebook | Purpose | Run time |
+| --- | --- | --- |
+| `01_label_audit.ipynb` | Class counts, vote distributions, sentinel (-9999) check, working set summary | ~5 min (CPU) |
+| `02_results.ipynb` | Final performance figures for the report (confusion matrices, per-class F1, ablation) | ~2 min (CPU) |
+| `03_walkthrough.ipynb` | Complete presentation walkthrough: raw data → preprocessing → training demo → encoding → GradCAM → t-SNE → fusion → results | ~15 min (GPU recommended) |
+| `explore_tables.ipynb` | Initial EDA: load CSV, validate Galaxy Zoo fields, download and visualise sample images and spectra | ~5 min (CPU) |
+
+To execute a notebook non-interactively:
+
+```bash
+uv run jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=600 notebooks/03_walkthrough.ipynb
+```
+
+---
+
+## Results & Evaluation
+
+After all checkpoints are produced, generate the final comparison table:
+
+```bash
+uv run python -m src.evaluate
+```
+
+Output: `checkpoints/results_summary.csv`
+
+### Final model comparison (test set, 32,158 galaxies)
+
+| Model | Macro F1 | Accuracy | Elliptical F1 | Spiral F1 | Merger F1 |
+| --- | --- | --- | --- | --- | --- |
+| Tabular (XGBoost) | 0.775 | 94.0% | 0.944 | 0.942 | 0.439 |
+| Image (ResNet-18) | 0.807 | 95.7% | 0.967 | 0.959 | 0.501 |
+| Spectral (1D-CNN) | 0.563 | 77.7% | 0.770 | 0.800 | 0.118 |
+| **Fusion** | **0.873** | **96.5%** | **0.970** | **0.967** | **0.679** |
+
+Key findings:
+
+- **Image > Tabular** (+0.032 macro F1): spatial morphology carries information beyond aggregated photometric measurements.
+- **Spectral underperforms** (0.563): spectra encode physical properties (star formation, velocity dispersion), not spatial shape — they are an indirect morphology proxy.
+- **Fusion achieves the best performance** across all metrics. The largest gain is in merger F1 (+0.178 over image alone): mergers show both disturbed morphology *and* anomalous spectral signatures that are complementary signals.
+
+---
+
+## Project Architecture
+
+### Label construction
+
+Galaxy Zoo 1 vote fractions (from `zooVotes`) are thresholded at 0.60:
+
+```python
+# Assign label only where one morphology dominates
+df.loc[df['p_el'] > 0.60, 'label'] = 'elliptical'
+df.loc[df['p_cs'] > 0.60, 'label'] = 'spiral'   # p_cs = p_cw + p_acw + p_edge
+df.loc[df['p_mg'] > 0.60, 'label'] = 'merger'
+# Rows with no dominant class, p_dk >= 0.30, or nvote_tot < 20 are excluded
+```
+
+**Vote fractions are never used as input features** — they are the source of the labels and including them would produce trivially perfect accuracy (label leakage).
+
+### Feature engineering
+
+44 tabular features from `PhotoObj` + `SpecObj`. Key groups:
+
+| Feature group | Examples | What it encodes |
+| --- | --- | --- |
+| Extinction-corrected colours | `dered_g - dered_r`, `dered_r - dered_i` | Stellar population age (red = elliptical, blue = spiral) |
+| Profile weight | `fracDeV_r` | 1.0 = de Vaucouleurs bulge (elliptical), 0.0 = exponential disc (spiral) |
+| Concentration | `petroR90_r / petroR50_r` | Ellipticals ~3.5–5; spirals ~2–3.5 |
+| Shape | `deVAB_r`, `expAB_r`, `mE1_r`, `mE2_r` | Axis ratios; adaptive moment ellipticity (merger indicator) |
+| Spectroscopic | `spec_z`, `velDisp`, `theta_0–4` | Redshift, velocity dispersion, eigenspectrum PCA |
+
+Four `lnL*` profile log-likelihood columns were **dropped** after audit — 67–84% sentinel values (-9999) mean they carry no signal for the majority of galaxies.
+
+### Fusion architecture
+
+```text
+Image (224×224 JPEG) → ResNet-18 encoder  → 512-d
+Spectrum (2700 bins) → 1D-CNN encoder     → 128-d
+Tabular (44 features) → MLP encoder       → 64-d
+has_spectrum (0/1)                         → 1-d
+                           concat          → 705-d
+                           Linear(256) → ReLU → Dropout(0.3)
+                           Linear(3)   → logits
+```
+
+**Two-phase training:**
+
+1. **Phase 1** (10 epochs): freeze image and spectral encoders; cache their outputs in RAM; train only the fusion MLP head and tabular encoder (`batch_size=2048`).
+2. **Phase 2** (until early stopping): unfreeze all parameters; joint fine-tuning at `lr=1e-5` with `CosineAnnealingLR`.
+
+### Spectrum preprocessing
+
+Each FITS spectrum is resampled to a uniform 3800–9200 Å grid (2700 bins at 2 Å/px), flux values are clipped at ±5σ, then normalised by median absolute flux. Missing spectra are zero-filled; a binary `has_spectrum` flag is passed to the fusion model.
+
+---
+
+## Troubleshooting
+
+**`input/tables/DATA7901_DR19_merged.csv` not found**
+The data files are gitignored. Follow the [Data Acquisition](#data-acquisition) steps to generate them.
+
+**CUDA out of memory**
+Reduce `BATCH_SIZE` in the training script, or use gradient accumulation. Image training default is 256; try 64 or 128.
+
+**Zombie CUDA process (Windows)**
+If a previous training run was killed abruptly, the CUDA context may still be held. Run `nvidia-smi` to find the PID and kill it:
+
+```powershell
+Stop-Process -Id <PID> -Force
+```
+
+**Merger class F1 near zero**
+Mergers are ~0.7% of the labeled set. Check that class-weighted loss is being used (`CrossEntropyLoss(weight=class_weights)`). If merger count is < 500, consider lowering the merger threshold to 0.40 in `src/data/labels.py`.
+
+**`KeyError: 'spec_z'` or `'Column8'`**
+The raw merged CSV uses CasJobs column aliases. `src/data/rename.py` maps `Column8` → `spec_z`. Ensure `apply_renames(df)` is called after loading the CSV.
+
+**Spectra 404 errors**
+Not all `plate/mjd/fiberid` combinations exist at the SDSS archive. The downloader logs failures to `input/tables/spectra_download_failures.txt`. The fusion model handles missing spectra via zero-fill + `has_spectrum=0`.
+
+**`uv sync` fails (torch CUDA version mismatch)**
+Edit `pyproject.toml` to change the PyTorch index URL to match your CUDA version (e.g., `cu121`, `cpu`). Then re-run `uv sync`.
+
+---
+
+## Data Sources
+
+- **SDSS DR19 CasJobs** — SQL queries for `PhotoObj`, `SpecObj`, `zooVotes`: [https://casjobs.sdss.org/casjobs/](https://casjobs.sdss.org/casjobs/)
+- **DESI Legacy Survey** — galaxy image cutouts (JPEG): [https://www.legacysurvey.org/](https://www.legacysurvey.org/)
+- **SDSS DR19 archive** — spectral FITS files: [https://data.sdss.org/sas/dr19/](https://data.sdss.org/sas/dr19/)
+- **Galaxy Zoo 1** — Lintott, C. et al. (2011), MNRAS, 410, 166. [ADS](https://ui.adsabs.harvard.edu/abs/2011MNRAS.410..166L/abstract)
